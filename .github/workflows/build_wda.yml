@@ -1,7 +1,7 @@
-name: Build WDA IPA
+name: Build WDA IPA (with xctest signing for iOS 26)
 
 on:
-  workflow_dispatch:  # Chạy thủ công trên GitHub Actions
+  workflow_dispatch:
 
 jobs:
   build:
@@ -11,20 +11,26 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: appium/WebDriverAgent
+          ref: main
           submodules: true
 
-      - name: Setup Xcode
+      - name: Setup Xcode (latest)
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
 
-      - name: Download Dependencies (Carthage/SPM)
+      - name: Show Xcode + iOS SDK version
         run: |
-          # Chạy script bootstrap để lấy các dependencies cần thiết (nếu có)
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Bootstrap WDA dependencies
+        run: |
           if [ -f "./Scripts/bootstrap.sh" ]; then
-            ./Scripts/bootstrap.sh -d
+            bash ./Scripts/bootstrap.sh -d
           fi
 
+      # Build không cần certificate — sẽ ad-hoc sign sau
       - name: Build WDA
         run: |
           xcodebuild \
@@ -39,14 +45,65 @@ jobs:
             clean build \
             CONFIGURATION_BUILD_DIR=$PWD/build
 
-          # Đóng gói thư mục build app thành file IPA
+      # ── KEY STEP: Ad-hoc sign TẤT CẢ binary trong bundle ─────────────────
+      # iOS 26 yêu cầu tất cả code phải có ít nhất ad-hoc signature
+      - name: Ad-hoc sign all binaries (iOS 26 fix)
+        run: |
+          APP="$PWD/build/WebDriverAgentRunner-Runner.app"
+          echo "App path: $APP"
+          ls -la "$APP"
+
+          # Sign xctest frameworks trước
+          find "$APP" -name "*.framework" -type d | while read fw; do
+            BIN="$fw/$(basename ${fw%.framework})"
+            if [ -f "$BIN" ]; then
+              echo "Signing framework: $BIN"
+              codesign --force --sign - "$BIN" 2>/dev/null || true
+            fi
+          done
+
+          # Sign xctest bundles
+          find "$APP/PlugIns" -name "*.xctest" -type d | while read xt; do
+            BIN="$xt/$(basename ${xt%.xctest})"
+            if [ -f "$BIN" ]; then
+              echo "Signing xctest binary: $BIN"
+              codesign --force --sign - "$BIN"
+              codesign -dvvv "$BIN" 2>&1 | head -5
+            fi
+          done
+
+          # Sign các dylib
+          find "$APP" -name "*.dylib" | while read f; do
+            echo "Signing dylib: $f"
+            codesign --force --sign - "$f" 2>/dev/null || true
+          done
+
+          # Sign main app binary
+          MAIN_BIN="$APP/WebDriverAgentRunner-Runner"
+          if [ -f "$MAIN_BIN" ]; then
+            echo "Signing main binary: $MAIN_BIN"
+            codesign --force --sign - "$MAIN_BIN"
+          fi
+
+          # Sign toàn bộ app bundle
+          echo "Signing entire .app bundle..."
+          codesign --force --deep --sign - "$APP"
+
+          echo "=== Verification ==="
+          codesign -dvvv "$APP" 2>&1 | head -10
+          codesign -dvvv "$APP/PlugIns/WebDriverAgentRunner.xctest/WebDriverAgentRunner" 2>&1 | head -5
+
+      # Đóng gói IPA
+      - name: Package IPA
+        run: |
           mkdir -p Payload
           cp -r build/WebDriverAgentRunner-Runner.app Payload/
-          zip -r WebDriverAgentRunner.ipa Payload/
+          zip -r WebDriverAgentRunner-AdHoc.ipa Payload/
+          ls -lh WebDriverAgentRunner-AdHoc.ipa
 
-      - name: Upload IPA Artifact
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: WebDriverAgentRunner-IPA
-          path: WebDriverAgentRunner.ipa
-          retention-days: 7
+          name: WebDriverAgentRunner-AdHoc-IPA
+          path: WebDriverAgentRunner-AdHoc.ipa
+          retention-days: 14
