@@ -1,109 +1,92 @@
-name: Build WDA IPA (with xctest signing for iOS 26)
+name: Build WDA for iOS 18
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - name: Checkout WebDriverAgent
         uses: actions/checkout@v4
         with:
           repository: appium/WebDriverAgent
-          ref: main
+          ref: master
           submodules: true
 
-      - name: Setup Xcode (latest)
+      - name: Setup Xcode 16
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: latest-stable
+          xcode-version: '16.2'
 
-      - name: Show Xcode + iOS SDK version
+      - name: Show versions
         run: |
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
+          sw_vers
 
-      - name: Bootstrap WDA dependencies
+      - name: Bootstrap
         run: |
           if [ -f "./Scripts/bootstrap.sh" ]; then
             bash ./Scripts/bootstrap.sh -d
           fi
 
-      # Build không cần certificate — sẽ ad-hoc sign sau
-      - name: Build WDA
+      - name: Build WDA for arm64
         run: |
           xcodebuild \
             -project WebDriverAgent.xcodeproj \
             -scheme WebDriverAgentRunner \
             -sdk iphoneos \
             -configuration Release \
+            -destination generic/platform=iOS \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
+            ARCHS=arm64 \
             ONLY_ACTIVE_ARCH=NO \
             clean build \
-            CONFIGURATION_BUILD_DIR=$PWD/build
+            GCC_PREPROCESSOR_DEFINITIONS='$(inherited) USE_PORT=8100' \
+            CONFIGURATION_BUILD_DIR=$PWD/build 2>&1 | tail -20
 
-      # ── KEY STEP: Ad-hoc sign TẤT CẢ binary trong bundle ─────────────────
-      # iOS 26 yêu cầu tất cả code phải có ít nhất ad-hoc signature
-      - name: Ad-hoc sign all binaries (iOS 26 fix)
+      - name: Ad-hoc sign all binaries
         run: |
           APP="$PWD/build/WebDriverAgentRunner-Runner.app"
-          echo "App path: $APP"
-          ls -la "$APP"
-
-          # Sign xctest frameworks trước
+          
           find "$APP" -name "*.framework" -type d | while read fw; do
             BIN="$fw/$(basename ${fw%.framework})"
-            if [ -f "$BIN" ]; then
-              echo "Signing framework: $BIN"
-              codesign --force --sign - "$BIN" 2>/dev/null || true
-            fi
+            [ -f "$BIN" ] && codesign --force --sign - "$BIN" 2>/dev/null || true
           done
-
-          # Sign xctest bundles
+          
           find "$APP/PlugIns" -name "*.xctest" -type d | while read xt; do
             BIN="$xt/$(basename ${xt%.xctest})"
-            if [ -f "$BIN" ]; then
-              echo "Signing xctest binary: $BIN"
-              codesign --force --sign - "$BIN"
-              codesign -dvvv "$BIN" 2>&1 | head -5
-            fi
+            [ -f "$BIN" ] && codesign --force --sign - "$BIN"
           done
-
-          # Sign các dylib
+          
           find "$APP" -name "*.dylib" | while read f; do
-            echo "Signing dylib: $f"
             codesign --force --sign - "$f" 2>/dev/null || true
           done
-
-          # Sign main app binary
+          
           MAIN_BIN="$APP/WebDriverAgentRunner-Runner"
-          if [ -f "$MAIN_BIN" ]; then
-            echo "Signing main binary: $MAIN_BIN"
-            codesign --force --sign - "$MAIN_BIN"
-          fi
-
-          # Sign toàn bộ app bundle
-          echo "Signing entire .app bundle..."
+          [ -f "$MAIN_BIN" ] && codesign --force --sign - "$MAIN_BIN"
+          
           codesign --force --deep --sign - "$APP"
+          echo "=== Signed ==="
+          codesign -dvvv "$APP" 2>&1 | head -5
 
-          echo "=== Verification ==="
-          codesign -dvvv "$APP" 2>&1 | head -10
-          codesign -dvvv "$APP/PlugIns/WebDriverAgentRunner.xctest/WebDriverAgentRunner" 2>&1 | head -5
-
-      # Đóng gói IPA
       - name: Package IPA
         run: |
           mkdir -p Payload
           cp -r build/WebDriverAgentRunner-Runner.app Payload/
-          zip -r WebDriverAgentRunner-AdHoc.ipa Payload/
-          ls -lh WebDriverAgentRunner-AdHoc.ipa
+          zip -r WebDriverAgent-iOS18.ipa Payload/
+          ls -lh WebDriverAgent-iOS18.ipa
+          
+          # Also show SDK version in filename
+          SDK_VER=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "Built with iOS SDK $SDK_VER"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: WebDriverAgentRunner-AdHoc-IPA
-          path: WebDriverAgentRunner-AdHoc.ipa
-          retention-days: 14
+          name: WDA-iOS18-IPA
+          path: WebDriverAgent-iOS18.ipa
+          retention-days: 30
